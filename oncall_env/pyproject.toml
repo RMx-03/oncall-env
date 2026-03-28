@@ -1,0 +1,42 @@
+[project]
+name = "oncall-env"
+version = "0.1.0"
+description = "Incident Response & Log Triage OpenEnv Environment — simulates production incident response for AI agent training"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Rohit Mishra", email = "rohit20032012@gmail.com"}]
+readme = "README.md"
+
+dependencies = [
+    "openenv-core>=0.1.0",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.0.0",
+    "openai>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "httpx>=0.25.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 88
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "C4"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
