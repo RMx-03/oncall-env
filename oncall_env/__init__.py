@@ -10,6 +10,7 @@ metrics, and alerts from a simulated microservices infrastructure and must:
 3. Remediate — Identify root cause and execute the correct fix
 
 Public API:
+    IncidentTriageEnv    — Typed EnvClient for this environment
     IncidentAction       — What the agent can do
     IncidentObservation  — What the agent sees
     IncidentState        — Internal episode metadata
@@ -19,6 +20,7 @@ Public API:
     ServiceStatus        — Service health status
 """
 
+from .client import IncidentTriageEnv
 from .models import (
     Alert,
     IncidentAction,
@@ -30,6 +32,7 @@ from .models import (
 )
 
 __all__ = [
+    "IncidentTriageEnv",
     "IncidentAction",
     "IncidentObservation",
     "IncidentState",
