@@ -2,7 +2,6 @@
 import sys
 import os
 
-# Dynamically add the workspace root to sys.path
 script_dir = os.path.dirname(os.path.abspath(__file__))
 workspace_root = os.path.dirname(os.path.dirname(script_dir))
 sys.path.insert(0, workspace_root)

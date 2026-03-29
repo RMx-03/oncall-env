@@ -1,0 +1,352 @@
+{
+  "scenarios": [
+    {
+      "scenario_id": "db_connection_pool_exhaustion",
+      "difficulty": "medium",
+      "title": "Database Connection Pool Exhaustion",
+      "incident_summary": "Intermittent 503 errors on order-related endpoints. Latency spikes observed across multiple services. Database team has not reported any issues.",
+      "ground_truth": {
+        "severity": "P1",
+        "root_cause": "PostgreSQL connection pool exhaustion on order-db caused by a connection leak in order-svc after a recent deployment. Connections are opened but never returned to the pool, causing cascading failures.",
+        "root_cause_category": "database",
+        "remediation_action": "failover_db",
+        "remediation_target": "order-db",
+        "affected_services": ["order-db", "order-svc", "api-gw"],
+        "root_service": "order-db"
+      },
+      "affected_services": ["order-db", "order-svc", "api-gw"],
+      "root_service": "order-db",
+      "service_states": {
+        "api-gw": "degraded",
+        "order-svc": "degraded",
+        "order-db": "degraded",
+        "payment-svc": "healthy",
+        "auth-svc": "healthy",
+        "notification-svc": "healthy",
+        "cache": "healthy",
+        "search-svc": "healthy"
+      },
+      "log_config": {
+        "order-db": {
+          "error_patterns": [
+            "FATAL: remaining connection slots are reserved for superuser",
+            "Connection pool exhausted — max_connections=100 all in use",
+            "Unable to acquire connection within 30s timeout",
+            "pg_stat_activity shows 98 active connections (limit: 100)"
+          ],
+          "warn_patterns": [
+            "Connection pool utilization at 95% — approaching limit",
+            "Slow query detected: 8200ms for SELECT on orders table",
+            "Lock contention detected on table: order_items"
+          ]
+        },
+        "order-svc": {
+          "error_patterns": [
+            "Database connection timeout after 30000ms",
+            "Failed to execute query — no available connections",
+            "Transaction rolled back — connection pool timeout"
+          ],
+          "warn_patterns": [
+            "Retrying database connection (attempt 3/5)",
+            "Query latency 4500ms exceeds 2000ms SLA threshold"
+          ]
+        },
+        "api-gw": {
+          "error_patterns": [
+            "Upstream order-svc returned 503 Service Unavailable"
+          ],
+          "warn_patterns": [
+            "Retry budget exhausted for order-svc — returning 503",
+            "Circuit breaker HALF-OPEN for order-svc"
+          ]
+        },
+        "auth-svc": {
+          "error_patterns": [],
+          "warn_patterns": [
+            "Unusual spike in authentication requests — possible retry storm from clients"
+          ]
+        }
+      },
+      "metric_config": {
+        "order-db": {
+          "connections": {"min": 90.0, "max": 100.0},
+          "cpu": {"min": 70.0, "max": 95.0},
+          "latency_p99": {"min": 3000.0, "max": 12000.0}
+        },
+        "order-svc": {
+          "error_rate": {"min": 20.0, "max": 50.0},
+          "latency_p99": {"min": 4000.0, "max": 15000.0}
+        },
+        "api-gw": {
+          "error_rate": {"min": 10.0, "max": 25.0}
+        }
+      },
+      "alert_config": [
+        {
+          "alert_id": "ALT-001",
+          "severity": "critical",
+          "service": "order-db",
+          "title": "Database Connection Pool Near Capacity",
+          "description": "PostgreSQL connections at 98/100. New connections are being rejected.",
+          "fired_at": "2026-01-15T13:50:00Z"
+        },
+        {
+          "alert_id": "ALT-002",
+          "severity": "critical",
+          "service": "order-svc",
+          "title": "High Error Rate on Order Service",
+          "description": "Error rate exceeded 20% for order-svc. Multiple database connection timeouts observed.",
+          "fired_at": "2026-01-15T13:52:00Z"
+        },
+        {
+          "alert_id": "ALT-003",
+          "severity": "warning",
+          "service": "api-gw",
+          "title": "Elevated 503 Responses",
+          "description": "503 response rate on /api/orders at 12%. Upstream order-svc returning errors.",
+          "fired_at": "2026-01-15T13:53:00Z"
+        }
+      ]
+    },
+    {
+      "scenario_id": "bad_deploy_latency_spike",
+      "difficulty": "medium",
+      "title": "Bad Deployment Causes Latency Cascade",
+      "incident_summary": "Significant latency increase across order processing pipeline. P99 latency jumped from 200ms to 8000ms in the last 30 minutes. No recent infrastructure changes reported but a deployment was rolled out to order-svc earlier today.",
+      "ground_truth": {
+        "severity": "P2",
+        "root_cause": "A recent deployment to order-svc introduced an N+1 query bug in the order listing endpoint. Each order list request now fires 200+ individual database queries instead of a single batch query, causing order-db CPU saturation and cascading latency to api-gw.",
+        "root_cause_category": "database",
+        "remediation_action": "rollback_deploy",
+        "remediation_target": "order-svc",
+        "affected_services": ["order-svc", "order-db", "api-gw"],
+        "root_service": "order-svc"
+      },
+      "affected_services": ["order-svc", "order-db", "api-gw"],
+      "root_service": "order-svc",
+      "service_states": {
+        "api-gw": "degraded",
+        "order-svc": "degraded",
+        "order-db": "degraded",
+        "payment-svc": "healthy",
+        "auth-svc": "healthy",
+        "notification-svc": "healthy",
+        "cache": "healthy",
+        "search-svc": "healthy"
+      },
+      "log_config": {
+        "order-svc": {
+          "error_patterns": [
+            "Request GET /api/orders timed out after 30000ms",
+            "Thread pool exhausted — all 200 worker threads busy",
+            "Slow database query: 4200ms for SELECT on orders JOIN order_items"
+          ],
+          "warn_patterns": [
+            "Query count per request: 215 queries (expected: 1-3)",
+            "Request latency 8500ms exceeds 2000ms SLA threshold",
+            "Connection pool wait time: 12000ms"
+          ]
+        },
+        "order-db": {
+          "error_patterns": [
+            "Too many connections — approaching max_connections limit",
+            "Query execution time 5200ms exceeds statement_timeout=30s threshold for monitoring"
+          ],
+          "warn_patterns": [
+            "CPU utilization at 92% — approaching saturation",
+            "Active queries: 85 (normal baseline: 15-20)",
+            "Slow query log: 200+ identical SELECT statements from single session"
+          ]
+        },
+        "api-gw": {
+          "error_patterns": [
+            "Upstream order-svc response timeout after 30s",
+            "504 Gateway Timeout for GET /api/orders"
+          ],
+          "warn_patterns": [
+            "Order-svc P99 latency 8200ms (SLA: 500ms)",
+            "Circuit breaker HALF-OPEN for order-svc"
+          ]
+        },
+        "cache": {
+          "error_patterns": [],
+          "warn_patterns": [
+            "Cache miss rate elevated: 45% (baseline: 12%) — possible cache key change after deployment"
+          ]
+        }
+      },
+      "metric_config": {
+        "order-svc": {
+          "latency_p99": {"min": 5000.0, "max": 12000.0},
+          "cpu": {"min": 75.0, "max": 95.0},
+          "error_rate": {"min": 15.0, "max": 35.0}
+        },
+        "order-db": {
+          "cpu": {"min": 80.0, "max": 98.0},
+          "connections": {"min": 70.0, "max": 90.0},
+          "latency_p99": {"min": 3000.0, "max": 8000.0}
+        },
+        "api-gw": {
+          "latency_p99": {"min": 5000.0, "max": 15000.0},
+          "error_rate": {"min": 10.0, "max": 30.0}
+        }
+      },
+      "alert_config": [
+        {
+          "alert_id": "ALT-001",
+          "severity": "critical",
+          "service": "order-svc",
+          "title": "P99 Latency SLA Breach",
+          "description": "Order service P99 latency at 8200ms, exceeding 500ms SLA. Started after deployment v2.14.0 at 09:00 UTC.",
+          "fired_at": "2026-01-15T13:30:00Z"
+        },
+        {
+          "alert_id": "ALT-002",
+          "severity": "warning",
+          "service": "order-db",
+          "title": "Database CPU Saturation",
+          "description": "order-db CPU utilization at 92%. Unusually high query volume detected.",
+          "fired_at": "2026-01-15T13:35:00Z"
+        },
+        {
+          "alert_id": "ALT-003",
+          "severity": "warning",
+          "service": "api-gw",
+          "title": "Gateway Timeout Errors Increasing",
+          "description": "504 error rate on order endpoints at 18%. Upstream order-svc not responding within timeout.",
+          "fired_at": "2026-01-15T13:40:00Z"
+        }
+      ]
+    },
+    {
+      "scenario_id": "cache_eviction_storm",
+      "difficulty": "medium",
+      "title": "Cache Eviction Storm",
+      "incident_summary": "Sudden spike in response times across all customer-facing endpoints. The cache service memory usage is fluctuating wildly. Multiple services reporting increased latency to downstream dependencies.",
+      "ground_truth": {
+        "severity": "P2",
+        "root_cause": "A runaway batch job is flooding the cache with large temporary keys, triggering aggressive LRU evictions of hot production data. This causes a thundering herd of cache misses, overwhelming the order-db and payment-svc with requests that would normally be served from cache.",
+        "root_cause_category": "resource",
+        "remediation_action": "flush_cache",
+        "remediation_target": "cache",
+        "affected_services": ["cache", "order-svc", "payment-svc", "api-gw"],
+        "root_service": "cache"
+      },
+      "affected_services": ["cache", "order-svc", "payment-svc", "api-gw"],
+      "root_service": "cache",
+      "service_states": {
+        "api-gw": "degraded",
+        "order-svc": "degraded",
+        "order-db": "degraded",
+        "payment-svc": "degraded",
+        "auth-svc": "healthy",
+        "notification-svc": "healthy",
+        "cache": "degraded",
+        "search-svc": "healthy"
+      },
+      "log_config": {
+        "cache": {
+          "error_patterns": [
+            "OOM prevention: evicting 15000 keys to free memory (used: 3.8GB/4GB)",
+            "Eviction rate: 5200 keys/sec — 10x above normal baseline",
+            "WARNING: memory fragmentation ratio 2.1 — allocation failures possible",
+            "Large key detected: batch:export:chunk_4582 (size: 48MB) — exceeds max-key-size recommendation"
+          ],
+          "warn_patterns": [
+            "Connected clients: 450 (normal: 120) — thundering herd detected",
+            "Cache hit rate dropped to 22% (normal: 92%)",
+            "Keyspace notifications: 12000 key eviction events in last 60s"
+          ]
+        },
+        "order-svc": {
+          "error_patterns": [
+            "Cache MISS for hot key order:catalog:pricing — falling back to database",
+            "Database query surge: 500 requests/s (normal: 50)"
+          ],
+          "warn_patterns": [
+            "Cache miss rate: 78% (threshold: 20%)",
+            "Response latency 3500ms — cache fallback to DB"
+          ]
+        },
+        "payment-svc": {
+          "error_patterns": [
+            "Cache MISS for payment:config:rates — loading from cold storage",
+            "Payment processing delayed: currency rate lookup timed out"
+          ],
+          "warn_patterns": [
+            "Exchange rate cache expired — 3 sequential misses"
+          ]
+        },
+        "api-gw": {
+          "error_patterns": [],
+          "warn_patterns": [
+            "Overall P99 latency 4200ms (SLA: 500ms)",
+            "Rate limiting activated for /api/orders — backpressure applied"
+          ]
+        },
+        "order-db": {
+          "error_patterns": [],
+          "warn_patterns": [
+            "Query volume spike: 500 qps (baseline: 50) — possible cache miss storm",
+            "CPU utilization 82% — elevated due to increased query load"
+          ]
+        }
+      },
+      "metric_config": {
+        "cache": {
+          "memory": {"min": 90.0, "max": 100.0},
+          "cpu": {"min": 60.0, "max": 85.0},
+          "error_rate": {"min": 5.0, "max": 15.0}
+        },
+        "order-svc": {
+          "latency_p99": {"min": 2000.0, "max": 6000.0},
+          "error_rate": {"min": 8.0, "max": 20.0}
+        },
+        "payment-svc": {
+          "latency_p99": {"min": 2000.0, "max": 5000.0},
+          "error_rate": {"min": 5.0, "max": 12.0}
+        },
+        "order-db": {
+          "cpu": {"min": 70.0, "max": 90.0}
+        },
+        "api-gw": {
+          "latency_p99": {"min": 3000.0, "max": 8000.0}
+        }
+      },
+      "alert_config": [
+        {
+          "alert_id": "ALT-001",
+          "severity": "critical",
+          "service": "cache",
+          "title": "Cache Memory Pressure Critical",
+          "description": "Redis memory at 3.8GB/4GB. Aggressive LRU eviction in progress. Hit rate dropped to 22%.",
+          "fired_at": "2026-01-15T13:42:00Z"
+        },
+        {
+          "alert_id": "ALT-002",
+          "severity": "warning",
+          "service": "order-svc",
+          "title": "Cache Miss Rate Elevated",
+          "description": "Cache miss rate for order-svc at 78%. Database fallback queries increasing.",
+          "fired_at": "2026-01-15T13:44:00Z"
+        },
+        {
+          "alert_id": "ALT-003",
+          "severity": "warning",
+          "service": "order-db",
+          "title": "Database Query Volume Spike",
+          "description": "Query volume increased 10x from baseline. Likely cache miss storm.",
+          "fired_at": "2026-01-15T13:45:00Z"
+        },
+        {
+          "alert_id": "ALT-004",
+          "severity": "warning",
+          "service": "payment-svc",
+          "title": "Payment Processing Delays",
+          "description": "Payment confirmation latency increased. Cache misses on exchange rate data.",
+          "fired_at": "2026-01-15T13:46:00Z"
+        }
+      ]
+    }
+  ]
+}

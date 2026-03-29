@@ -1,0 +1,260 @@
+{
+  "scenarios": [
+    {
+      "scenario_id": "oom_crash",
+      "difficulty": "easy",
+      "title": "Order Service OOM Crash",
+      "incident_summary": "Multiple 5xx errors reported on /api/orders. The order-svc appears unresponsive and health checks are failing. Customer-facing impact confirmed.",
+      "ground_truth": {
+        "severity": "P2",
+        "root_cause": "Out of memory error in order-svc due to a memory leak in the request handler causing the JVM to exceed its heap limit and crash repeatedly.",
+        "root_cause_category": "resource",
+        "remediation_action": "restart_service",
+        "remediation_target": "order-svc",
+        "affected_services": ["order-svc"],
+        "root_service": "order-svc"
+      },
+      "affected_services": ["order-svc"],
+      "root_service": "order-svc",
+      "service_states": {
+        "api-gw": "degraded",
+        "order-svc": "down",
+        "order-db": "healthy",
+        "payment-svc": "healthy",
+        "auth-svc": "healthy",
+        "notification-svc": "healthy",
+        "cache": "healthy",
+        "search-svc": "healthy"
+      },
+      "log_config": {
+        "order-svc": {
+          "error_patterns": [
+            "java.lang.OutOfMemoryError: Java heap space",
+            "Service terminated — exit code 137 (OOM killed)",
+            "GC overhead limit exceeded — pausing all threads",
+            "Failed to allocate 256MB for new buffer pool"
+          ],
+          "warn_patterns": [
+            "Heap usage at 92% — approaching configured limit",
+            "GC pause time: 4500ms exceeds 1000ms threshold",
+            "Memory pool 'Old Gen' usage above 85%"
+          ]
+        },
+        "api-gw": {
+          "error_patterns": [
+            "Upstream service order-svc returned 502 Bad Gateway",
+            "Circuit breaker OPEN for upstream order-svc"
+          ],
+          "warn_patterns": [
+            "Upstream order-svc response time 12000ms exceeds 5000ms threshold"
+          ]
+        }
+      },
+      "metric_config": {
+        "order-svc": {
+          "cpu": {"min": 0.0, "max": 5.0},
+          "memory": {"min": 98.0, "max": 100.0},
+          "error_rate": {"min": 80.0, "max": 100.0},
+          "latency_p99": {"min": 5000.0, "max": 30000.0},
+          "request_rate": {"min": 0.0, "max": 10.0}
+        },
+        "api-gw": {
+          "error_rate": {"min": 15.0, "max": 35.0},
+          "latency_p99": {"min": 3000.0, "max": 12000.0}
+        }
+      },
+      "alert_config": [
+        {
+          "alert_id": "ALT-001",
+          "severity": "critical",
+          "service": "order-svc",
+          "title": "Service order-svc Not Responding",
+          "description": "Health check failed for order-svc. Last 5 probes timed out. Service appears down.",
+          "fired_at": "2026-01-15T13:55:00Z"
+        },
+        {
+          "alert_id": "ALT-002",
+          "severity": "warning",
+          "service": "api-gw",
+          "title": "High Error Rate on API Gateway",
+          "description": "Error rate for /api/orders endpoint exceeded 15% threshold. Currently at 28%.",
+          "fired_at": "2026-01-15T13:56:00Z"
+        }
+      ]
+    },
+    {
+      "scenario_id": "disk_full",
+      "difficulty": "easy",
+      "title": "Order Database Disk Full",
+      "incident_summary": "Order creation failing with database write errors. Customers unable to complete purchases. The order-db service is reporting critical storage issues.",
+      "ground_truth": {
+        "severity": "P1",
+        "root_cause": "Order database disk volume reached 100% capacity due to unarchived transaction logs and unbounded query audit logging filling the disk.",
+        "root_cause_category": "resource",
+        "remediation_action": "scale_up",
+        "remediation_target": "order-db",
+        "affected_services": ["order-db"],
+        "root_service": "order-db"
+      },
+      "affected_services": ["order-db", "order-svc"],
+      "root_service": "order-db",
+      "service_states": {
+        "api-gw": "degraded",
+        "order-svc": "degraded",
+        "order-db": "down",
+        "payment-svc": "healthy",
+        "auth-svc": "healthy",
+        "notification-svc": "healthy",
+        "cache": "healthy",
+        "search-svc": "healthy"
+      },
+      "log_config": {
+        "order-db": {
+          "error_patterns": [
+            "ERROR: could not write to file 'pg_wal/000000010000000100000042': No space left on device",
+            "PANIC: could not write to log file: No space left on device",
+            "FATAL: database system is in recovery mode — refusing connections",
+            "ERROR: could not extend file 'base/16384/2619': No space left on device"
+          ],
+          "warn_patterns": [
+            "WARNING: disk usage at 98% — approaching critical threshold",
+            "WARNING: WAL archiving falling behind — 12 segments pending",
+            "WARNING: autovacuum cancelled due to insufficient disk space"
+          ]
+        },
+        "order-svc": {
+          "error_patterns": [
+            "Failed to insert order record — database write error",
+            "Transaction aborted: SQLSTATE 53100 (disk_full)"
+          ],
+          "warn_patterns": [
+            "Database write latency 8500ms — SLA threshold 2000ms",
+            "Order creation retry failed (attempt 3/3)"
+          ]
+        },
+        "api-gw": {
+          "error_patterns": [
+            "Upstream order-svc returned 500 Internal Server Error"
+          ],
+          "warn_patterns": [
+            "POST /api/orders error rate at 45%"
+          ]
+        }
+      },
+      "metric_config": {
+        "order-db": {
+          "cpu": {"min": 35.0, "max": 55.0},
+          "memory": {"min": 70.0, "max": 85.0},
+          "error_rate": {"min": 90.0, "max": 100.0},
+          "latency_p99": {"min": 8000.0, "max": 30000.0}
+        },
+        "order-svc": {
+          "error_rate": {"min": 40.0, "max": 60.0},
+          "latency_p99": {"min": 5000.0, "max": 15000.0}
+        },
+        "api-gw": {
+          "error_rate": {"min": 20.0, "max": 40.0}
+        }
+      },
+      "alert_config": [
+        {
+          "alert_id": "ALT-001",
+          "severity": "critical",
+          "service": "order-db",
+          "title": "Disk Usage Critical on order-db",
+          "description": "Disk utilization at 100%. Database unable to perform write operations. Immediate intervention required.",
+          "fired_at": "2026-01-15T13:48:00Z"
+        },
+        {
+          "alert_id": "ALT-002",
+          "severity": "critical",
+          "service": "order-svc",
+          "title": "Order Service Elevated Error Rate",
+          "description": "Error rate for order-svc exceeded 40%. All write operations failing.",
+          "fired_at": "2026-01-15T13:50:00Z"
+        }
+      ]
+    },
+    {
+      "scenario_id": "auth_oom_kill",
+      "difficulty": "easy",
+      "title": "Auth Service OOM Kill",
+      "incident_summary": "Users unable to log in or authenticate API requests. The auth-svc is not responding to health checks. Other services appear functional but returning 401 errors.",
+      "ground_truth": {
+        "severity": "P2",
+        "root_cause": "Auth service process was killed by the OOM killer after a memory leak in the JWT token cache caused resident memory to exceed the 4GB container limit.",
+        "root_cause_category": "resource",
+        "remediation_action": "restart_service",
+        "remediation_target": "auth-svc",
+        "affected_services": ["auth-svc"],
+        "root_service": "auth-svc"
+      },
+      "affected_services": ["auth-svc", "api-gw"],
+      "root_service": "auth-svc",
+      "service_states": {
+        "api-gw": "degraded",
+        "order-svc": "healthy",
+        "order-db": "healthy",
+        "payment-svc": "healthy",
+        "auth-svc": "down",
+        "notification-svc": "healthy",
+        "cache": "healthy",
+        "search-svc": "healthy"
+      },
+      "log_config": {
+        "auth-svc": {
+          "error_patterns": [
+            "FATAL: process killed (OOM) — container memory limit 4096MB exceeded",
+            "java.lang.OutOfMemoryError: GC overhead limit exceeded",
+            "Service terminated with signal SIGKILL (exit code 137)",
+            "Failed to allocate memory for JWT token cache expansion"
+          ],
+          "warn_patterns": [
+            "Heap usage at 95% — GC unable to free sufficient memory",
+            "Token cache size: 2.1M entries — unbounded growth detected",
+            "GC pause time: 6200ms — application threads frozen"
+          ]
+        },
+        "api-gw": {
+          "error_patterns": [
+            "Upstream auth-svc returned 502 Bad Gateway — health check failed",
+            "Authentication failed — auth service unreachable, returning 401"
+          ],
+          "warn_patterns": [
+            "Auth service response time 15000ms exceeds 3000ms timeout",
+            "Falling back to cached auth tokens (stale TTL: 300s)"
+          ]
+        }
+      },
+      "metric_config": {
+        "auth-svc": {
+          "cpu": {"min": 0.0, "max": 3.0},
+          "memory": {"min": 99.0, "max": 100.0},
+          "error_rate": {"min": 95.0, "max": 100.0},
+          "latency_p99": {"min": 10000.0, "max": 30000.0}
+        },
+        "api-gw": {
+          "error_rate": {"min": 25.0, "max": 50.0}
+        }
+      },
+      "alert_config": [
+        {
+          "alert_id": "ALT-001",
+          "severity": "critical",
+          "service": "auth-svc",
+          "title": "Service auth-svc Not Responding",
+          "description": "Health check failed for auth-svc. Process appears to have been OOM killed. Container restart pending.",
+          "fired_at": "2026-01-15T13:52:00Z"
+        },
+        {
+          "alert_id": "ALT-002",
+          "severity": "warning",
+          "service": "api-gw",
+          "title": "Authentication Failures Elevated",
+          "description": "401 response rate increased to 35%. Auth service appears unreachable.",
+          "fired_at": "2026-01-15T13:53:00Z"
+        }
+      ]
+    }
+  ]
+}
