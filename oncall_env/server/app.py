@@ -31,13 +31,19 @@ app = create_app(
 def main() -> None:
     """Entry point for direct execution.
 
+    Respects the ``PORT`` environment variable (set by HF Spaces).
+    Defaults to 7860 if not set.
+
     Usage::
 
         python -m oncall_env.server.app
     """
+    import os
+
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", "7860"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":

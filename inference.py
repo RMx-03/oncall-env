@@ -348,11 +348,11 @@ def run_episode(env_url: str, task_id: str) -> Dict[str, Any]:
         action_type = action.get("action_type", "?")
         print(f"    Step {step:2d}: {action_type:<25s}", end="")
 
-        # Execute action
+        # Execute action (OpenEnv HTTP API expects {"action": {...}})
         try:
             resp = requests.post(
                 f"{env_url}/step",
-                json=action,
+                json={"action": action},
                 timeout=30,
             )
             resp.raise_for_status()

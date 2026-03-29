@@ -1,0 +1,38 @@
+# Version control
+.git
+.gitignore
+
+# Plans and docs (not needed at runtime)
+.plans/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+oncall_env/.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test files (not needed in production image)
+oncall_env/tests/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose*.yml
