@@ -83,15 +83,18 @@ _provider = PROVIDER_CONFIGS[LLM_PROVIDER]
 
 # API_BASE_URL always overrides the provider default (hackathon compliance)
 API_BASE_URL = os.environ.get("API_BASE_URL", _provider["base_url"])
-API_KEY = os.environ.get(
-    "OPENAI_API_KEY",
-    os.environ.get(_provider["api_key_env"], ""),
+
+# Hackathon spec: HF_TOKEN > OPENAI_API_KEY > provider-specific key
+API_KEY = (
+    os.environ.get("HF_TOKEN")
+    or os.environ.get("OPENAI_API_KEY")
+    or os.environ.get(_provider["api_key_env"], "")
 )
 MODEL_NAME = os.environ.get("MODEL_NAME", _provider["default_model"])
 
 if not API_KEY:
     print(
-        f"ERROR: No API key found. Set OPENAI_API_KEY or "
+        f"ERROR: No API key found. Set HF_TOKEN, OPENAI_API_KEY, or "
         f"{_provider['api_key_env']} environment variable."
     )
     sys.exit(1)
@@ -122,31 +125,43 @@ client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 SYSTEM_PROMPT = """You are an expert SRE/DevOps engineer responding to a production incident.
+You have a LIMITED budget of actions. You MUST complete the full incident workflow before running out.
 
-You interact with an incident response environment by outputting a JSON action at each step.
+You interact with an incident response environment by outputting a SINGLE JSON action object.
 
 Available actions:
-- {"action_type": "query_logs", "service_name": "<service>", "time_range": "last_15m"}
-- {"action_type": "query_metrics", "service_name": "<service>", "metric_name": "<cpu|memory|latency_p99|error_rate|connections>"}
-- {"action_type": "check_alerts"}
-- {"action_type": "check_alerts", "service_name": "<service>"}
-- {"action_type": "check_service_status"} (all services) or {"action_type": "check_service_status", "service_name": "<service>"}
-- {"action_type": "set_severity", "severity": "<P1|P2|P3|P4>"}
-- {"action_type": "identify_root_cause", "root_cause": "<description>", "root_cause_category": "<database|network|config|resource|dependency|security>"}
-- {"action_type": "execute_remediation", "remediation_action": "<restart_service|scale_up|rollback_deploy|flush_cache|fix_config|failover_db>", "remediation_target": "<service>"}
-- {"action_type": "escalate", "escalation_team": "<database|network|security|platform>"}
+1. INVESTIGATE (do 2-4 of these, no more):
+   {"action_type": "check_alerts"}
+   {"action_type": "check_service_status"}
+   {"action_type": "query_logs", "service_name": "<service>"}
+   {"action_type": "query_metrics", "service_name": "<service>"}
+
+2. DIAGNOSE (do these after investigating):
+   {"action_type": "set_severity", "severity": "<P1|P2|P3|P4>"}
+   {"action_type": "identify_root_cause", "root_cause": "<description>", "root_cause_category": "<database|network|config|resource|dependency|security>"}
+
+3. REMEDIATE (do this LAST — it ends the episode):
+   {"action_type": "execute_remediation", "remediation_action": "<restart_service|scale_up|rollback_deploy|flush_cache|fix_config|failover_db>", "remediation_target": "<service>"}
 
 Available services: api-gw, order-svc, order-db, payment-svc, auth-svc, notification-svc, cache, search-svc
 
-Strategy:
-1. First check all alerts and service statuses to get an overview
-2. Query logs from affected services to find error patterns
-3. Query metrics to confirm hypotheses
-4. Set severity based on impact
-5. Identify root cause category and description
-6. Execute the appropriate remediation
+You MUST follow this exact workflow:
+  Step 1: check_alerts
+  Step 2: check_service_status
+  Step 3: query_logs for the most suspicious service
+  Step 4: query_metrics for the most suspicious service
+  Step 5: set_severity
+  Step 6: identify_root_cause
+  Step 7: execute_remediation
 
-IMPORTANT: Output ONLY a single JSON action object. No explanation before or after."""
+Do NOT repeat the same action. Do NOT keep investigating forever.
+After 4-5 investigation actions, you MUST move to set_severity, then identify_root_cause, then execute_remediation.
+
+CRITICAL RULES:
+- Output ONLY a single JSON object. No text before or after.
+- NEVER repeat an action you already took.
+- By step 5 you MUST start diagnosing (set_severity).
+- By step 7 you MUST execute remediation."""
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -169,26 +184,39 @@ def build_user_prompt(
     Returns:
         Formatted prompt string for the LLM.
     """
+    remaining = MAX_STEPS - step + 1
+    severity_set = observation.get('severity_set', False)
+    root_cause_identified = observation.get('root_cause_identified', False)
+    remediation_executed = observation.get('remediation_executed', False)
+
     parts: List[str] = [
-        f"## Step {step}/{MAX_STEPS}",
+        f"## Step {step}/{MAX_STEPS} ({remaining} steps remaining)",
         f"**Incident**: {observation.get('incident_summary', 'No summary available')}",
-        f"**Goal**: {observation.get('goal', 'Investigate and resolve the incident')}",
-        f"\n**Last action result**: {observation.get('action_result', 'Episode started')}",
     ]
 
-    # Log entries
+    # Show last action result
+    action_result = observation.get('action_result', 'Episode started')
+    parts.append(f"\n**Last action result**: {action_result}")
+
+    # Log entries — show ERROR/FATAL/WARN first, then INFO
     log_entries = observation.get("log_entries")
     if log_entries:
-        logs_text = "\n".join(
-            f"  [{entry['timestamp']}] {entry['level']} [{entry['service']}] {entry['message']}"
-            for entry in log_entries[:20]  # Cap to avoid token overflow
+        # Sort: errors first, then warnings, then info
+        severity_order = {"FATAL": 0, "ERROR": 1, "WARN": 2, "WARNING": 2, "INFO": 3, "DEBUG": 4}
+        sorted_logs = sorted(
+            log_entries,
+            key=lambda e: severity_order.get(e.get('level', 'INFO'), 3)
         )
-        parts.append(f"\n**Log entries**:\n{logs_text}")
+        logs_text = "\n".join(
+            f"  [{entry['level']}] [{entry['service']}] {entry['message']}"
+            for entry in sorted_logs[:20]
+        )
+        parts.append(f"\n**Log entries** (errors shown first):\n{logs_text}")
 
     # Metric data
     metric_data = observation.get("metric_data")
     if metric_data:
-        metrics_text = json.dumps(metric_data, indent=2, default=str)[:2000]
+        metrics_text = json.dumps(metric_data, indent=2, default=str)[:1500]
         parts.append(f"\n**Metrics**:\n{metrics_text}")
 
     # Alerts
@@ -204,28 +232,68 @@ def build_user_prompt(
     statuses = observation.get("service_statuses")
     if statuses:
         status_text = "\n".join(
-            f"  {s['service']}: {s['status']} (uptime: {s['uptime']}, last deploy: {s['last_deploy']})"
+            f"  {s['service']}: {s['status']}"
             for s in statuses
         )
         parts.append(f"\n**Service statuses**:\n{status_text}")
 
-    # Progress
+    # Progress flags
     parts.append(
-        f"\n**Progress**: severity_set={observation.get('severity_set', False)}, "
-        f"root_cause_identified={observation.get('root_cause_identified', False)}, "
-        f"remediation_executed={observation.get('remediation_executed', False)}"
-    )
-    parts.append(
-        f"**Available services**: {observation.get('available_services', [])}"
+        f"\n**Progress**: severity_set={severity_set}, "
+        f"root_cause_identified={root_cause_identified}, "
+        f"remediation_executed={remediation_executed}"
     )
 
-    # Action history (last 10)
-    if history:
-        parts.append("\n**Action history**:\n" + "\n".join(history[-10:]))
+    # Phase-aware urgency — this is the key to making the agent progress
+    if step >= 5 and not severity_set:
+        parts.append(
+            "\n⚠️ URGENT: You have investigated enough. You MUST now set_severity. "
+            "Output: {\"action_type\": \"set_severity\", \"severity\": \"P1|P2|P3|P4\"}"
+        )
+    elif severity_set and not root_cause_identified:
+        parts.append(
+            "\n⚠️ URGENT: Severity is set. You MUST now identify_root_cause. "
+            "Output: {\"action_type\": \"identify_root_cause\", \"root_cause\": \"<description>\", "
+            "\"root_cause_category\": \"database|network|config|resource|dependency|security\"}"
+        )
+    elif severity_set and root_cause_identified and not remediation_executed:
+        parts.append(
+            "\n⚠️ URGENT: Root cause identified. You MUST now execute_remediation. "
+            "Output: {\"action_type\": \"execute_remediation\", \"remediation_action\": "
+            "\"restart_service|scale_up|rollback_deploy|flush_cache|fix_config|failover_db\", "
+            "\"remediation_target\": \"<service>\"}"
+        )
+    elif remaining <= 3 and not severity_set:
+        parts.append(
+            "\n🚨 CRITICAL: Almost out of steps! You MUST set_severity NOW."
+        )
 
-    parts.append("\n**Output your next action as a JSON object:**")
+    parts.append("\nOutput your next action as a single JSON object:")
 
     return "\n".join(parts)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Helpers
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _guess_target_service(observation: Dict[str, Any]) -> str:
+    """Guess the most likely broken service from the observation.
+
+    Looks at service_statuses for 'down' or 'degraded' services.
+    Falls back to 'order-svc' as a reasonable default.
+    """
+    statuses = observation.get("service_statuses") or []
+    # Prefer 'down' services
+    for s in statuses:
+        if isinstance(s, dict) and s.get("status") == "down":
+            return s["service"]
+    # Then 'degraded'
+    for s in statuses:
+        if isinstance(s, dict) and s.get("status") == "degraded":
+            return s["service"]
+    return "order-svc"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -233,17 +301,53 @@ def build_user_prompt(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
+def _extract_json_object(text: str) -> Optional[str]:
+    """Extract the first top-level JSON object from text using bracket matching.
+
+    Unlike regex, this properly handles nested braces, escaped quotes,
+    and long string values.
+    """
+    start = text.find('{')
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+
+    for i in range(start, len(text)):
+        ch = text[i]
+
+        if escape:
+            escape = False
+            continue
+
+        if ch == '\\':
+            escape = True
+            continue
+
+        if ch == '"':
+            in_string = not in_string
+            continue
+
+        if in_string:
+            continue
+
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+
+    return None
+
+
 def parse_model_action(response_text: str) -> Dict[str, Any]:
     """Extract a JSON action dict from the model's response text.
 
-    Handles responses wrapped in markdown code blocks or with
-    surrounding explanation text.
-
-    Args:
-        response_text: Raw text from the LLM.
-
-    Returns:
-        Parsed action dict. Falls back to ``check_alerts`` on failure.
+    Uses bracket-matching to properly handle long strings and nested objects.
+    Falls back to ``check_alerts`` on parse failure.
     """
     if not response_text:
         return dict(FALLBACK_ACTION)
@@ -261,27 +365,17 @@ def parse_model_action(response_text: str) -> Dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
-    # Try to find JSON object in the text
-    json_match = re.search(r"\{[^{}]*\}", response_text)
-    if json_match:
+    # Use bracket-matching to extract the first JSON object
+    json_str = _extract_json_object(response_text)
+    if json_str:
         try:
-            parsed = json.loads(json_match.group())
+            parsed = json.loads(json_str)
             if isinstance(parsed, dict) and "action_type" in parsed:
                 return parsed
         except json.JSONDecodeError:
             pass
 
-    # Try nested JSON (for cases with nested objects)
-    json_match = re.search(r"\{[^}]*\{[^}]*\}[^}]*\}", response_text)
-    if json_match:
-        try:
-            parsed = json.loads(json_match.group())
-            if isinstance(parsed, dict) and "action_type" in parsed:
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    print(f"    WARNING: Could not parse action, using fallback. Raw: {response_text[:100]}")
+    print(f"    WARNING: Could not parse action, using fallback. Raw: {response_text[:200]}")
     return dict(FALLBACK_ACTION)
 
 
@@ -315,6 +409,9 @@ def run_episode(env_url: str, task_id: str) -> Dict[str, Any]:
     observation = result.get("observation", result)
 
     history: List[str] = []
+    conversation: List[Dict[str, str]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+    ]
     total_reward: float = 0.0
     steps_taken: int = 0
 
@@ -323,13 +420,15 @@ def run_episode(env_url: str, task_id: str) -> Dict[str, Any]:
         if result.get("done", False) or observation.get("done", False):
             break
 
-        # Build prompt and call LLM
+        # Build prompt and call LLM with full conversation history
         user_prompt = build_user_prompt(step, observation, history)
+        conversation.append({"role": "user", "content": user_prompt})
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ]
+        # Keep conversation manageable — system + last 14 messages
+        if len(conversation) > 15:
+            messages = [conversation[0]] + conversation[-14:]
+        else:
+            messages = list(conversation)
 
         try:
             completion = client.chat.completions.create(
@@ -343,9 +442,31 @@ def run_episode(env_url: str, task_id: str) -> Dict[str, Any]:
             print(f"    LLM error at step {step}: {e}")
             response_text = json.dumps(FALLBACK_ACTION)
 
+        # Add assistant response to conversation history
+        conversation.append({"role": "assistant", "content": response_text})
+
         # Parse action
         action = parse_model_action(response_text)
         action_type = action.get("action_type", "?")
+
+        # ── Force progression: prevent infinite loops ──
+        severity_set = observation.get("severity_set", False)
+        root_cause_identified = observation.get("root_cause_identified", False)
+
+        if severity_set and root_cause_identified and action_type not in ("execute_remediation", "escalate"):
+            # Agent already diagnosed but won't remediate — force it
+            print(f"    (forced progression: {action_type} → execute_remediation)")
+            # Use whatever the agent last said for remediation context
+            if not action.get("remediation_action"):
+                action = {
+                    "action_type": "execute_remediation",
+                    "remediation_action": "restart_service",
+                    "remediation_target": _guess_target_service(observation),
+                }
+            else:
+                action["action_type"] = "execute_remediation"
+            action_type = "execute_remediation"
+
         print(f"    Step {step:2d}: {action_type:<25s}", end="")
 
         # Execute action (OpenEnv HTTP API expects {"action": {...}})

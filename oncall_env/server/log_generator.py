@@ -165,11 +165,11 @@ def generate_log_entries(
     error_patterns: List[str] = log_cfg.get("error_patterns", [])
     warn_patterns: List[str] = log_cfg.get("warn_patterns", [])
 
-    # Determine the split: affected services get ~40% error logs
+    # Determine the split: affected services get majority error logs
     is_affected = bool(error_patterns or warn_patterns)
     if is_affected:
-        error_count = max(1, int(total_logs * 0.35))
-        warn_count = max(1, int(total_logs * 0.15)) if warn_patterns else 0
+        error_count = max(2, int(total_logs * 0.50))
+        warn_count = max(1, int(total_logs * 0.20)) if warn_patterns else 0
         healthy_count = total_logs - error_count - warn_count
     else:
         error_count = 0

@@ -148,7 +148,7 @@ pip install -r requirements.txt
 pip install -e oncall_env/
 
 # Start the environment server
-uvicorn oncall_env.server.app:app --host 0.0.0.0 --port 8000
+python -m uvicorn oncall_env.server.app:app --host 0.0.0.0 --port 8000
 ```
 
 ### Using the Typed Client
@@ -282,9 +282,3 @@ oncall-env/
 - **Dense reward signal**: Reward at every decision point (severity, root cause, remediation)
 - **Multi-provider inference**: Works with OpenAI, Groq, OpenRouter, Gemini, or any OpenAI-compatible API
 - **Modular architecture**: Clean separation of models, server, tasks, and scenarios
-
----
-
-## License
-
-MIT
