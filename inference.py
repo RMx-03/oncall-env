@@ -114,7 +114,7 @@ TEMPERATURE: float = 0.2
 MAX_TOKENS: int = 1024
 ENV_URL: str = os.environ.get("ENV_URL", "http://localhost:8000")
 DETERMINISTIC_BASELINE: bool = os.environ.get(
-    "DETERMINISTIC_BASELINE", "1"
+    "DETERMINISTIC_BASELINE", "0"
 ).lower() not in {
     "0",
     "false",
@@ -338,6 +338,33 @@ def parse_model_action(response_text: str) -> Optional[Dict[str, Any]]:
     except json.JSONDecodeError:
         return None
     return None
+
+
+def _extract_step_payload(step_result: Any) -> Tuple[Dict[str, Any], float, bool]:
+    """Normalize EnvClient step/reset outputs into (observation, reward, done)."""
+    if hasattr(step_result, "observation"):
+        obs_obj = getattr(step_result, "observation")
+        reward = getattr(step_result, "reward", 0.0)
+        done = bool(getattr(step_result, "done", False))
+        return _normalize_observation(obs_obj), float(reward or 0.0), done
+
+    # Some clients may return observation directly from reset
+    obs_dict = _normalize_observation(step_result)
+    reward = float(obs_dict.get("reward") or 0.0)
+    done = bool(obs_dict.get("done", False))
+    return obs_dict, reward, done
+
+
+def _extract_state_payload(env_client: Any) -> Dict[str, Any]:
+    """Read state from typed EnvClient across method/property variants."""
+    state_attr = getattr(env_client, "state", None)
+    if callable(state_attr):
+        state_obj = state_attr()
+    else:
+        state_obj = state_attr
+    if state_obj is None:
+        return {}
+    return _as_dict(state_obj)
 
 
 def _service_from_statuses(observation: Dict[str, Any]) -> str:
@@ -754,19 +781,9 @@ def run_episode(env_url: str, task_id: str) -> Dict[str, Any]:
     Returns:
         Dict with ``score``, ``steps``, ``total_reward``, ``duration_s``.
     """
-    import requests
+    from oncall_env import IncidentAction, IncidentTriageEnv
 
     start_time = time.time()
-
-    # Reset environment (fixed seed for reproducibility — hackathon requirement)
-    resp = requests.post(
-        f"{env_url}/reset",
-        json={"task_id": task_id, "seed": 42},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    result = resp.json()
-    observation = _normalize_observation(result.get("observation", result))
 
     history: List[str] = []
     conversation: List[Dict[str, str]] = [
@@ -789,120 +806,111 @@ def run_episode(env_url: str, task_id: str) -> Dict[str, Any]:
     policy.diagnostics = diagnostics
     last_phase = ""
 
-    for step in range(1, MAX_POLICY_STEPS + 1):
-        # Check if episode is done
-        if result.get("done", False) or observation.get("done", False):
-            diagnostics["terminal_reached"] = True
-            break
+    with IncidentTriageEnv(base_url=env_url).sync() as env:
+        reset_result = env.reset(task_id=task_id, seed=42)
+        observation, _, done = _extract_step_payload(reset_result)
 
-        _update_evidence(evidence, observation)
-        phase = _determine_phase(policy)
-        if phase != last_phase:
-            diagnostics["phase_transitions"].append(f"{step}:{phase}")
-            last_phase = phase
+        for step in range(1, MAX_POLICY_STEPS + 1):
+            if done or observation.get("done", False):
+                diagnostics["terminal_reached"] = True
+                break
 
-        category_hint, _, _ = _infer_category_and_remediation(evidence)
-        target_hint = _pick_target_service(observation, evidence, category_hint)
-        policy.target_service = target_hint
-        planned_action = _planned_action(policy, observation, step)
+            _update_evidence(evidence, observation)
+            phase = _determine_phase(policy)
+            if phase != last_phase:
+                diagnostics["phase_transitions"].append(f"{step}:{phase}")
+                last_phase = phase
 
-        action: Dict[str, Any]
-        repaired = False
-        if DETERMINISTIC_BASELINE:
-            action = planned_action
-        else:
-            user_prompt = build_user_prompt(step, observation, phase, target_hint)
-            conversation.append({"role": "user", "content": user_prompt})
+            category_hint, _, _ = _infer_category_and_remediation(evidence)
+            target_hint = _pick_target_service(observation, evidence, category_hint)
+            policy.target_service = target_hint
+            planned_action = _planned_action(policy, observation, step)
 
-            if len(conversation) > 15:
-                messages = [conversation[0]] + conversation[-14:]
+            action: Dict[str, Any]
+            repaired = False
+            if DETERMINISTIC_BASELINE:
+                action = planned_action
             else:
-                messages = list(conversation)
+                user_prompt = build_user_prompt(step, observation, phase, target_hint)
+                conversation.append({"role": "user", "content": user_prompt})
+
+                if len(conversation) > 15:
+                    messages = [conversation[0]] + conversation[-14:]
+                else:
+                    messages = list(conversation)
+
+                try:
+                    completion = client.chat.completions.create(
+                        model=MODEL_NAME,
+                        messages=messages,
+                        temperature=TEMPERATURE,
+                        max_tokens=MAX_TOKENS,
+                    )
+                    response_text = completion.choices[0].message.content or ""
+                except Exception as e:
+                    print(f"    LLM error at step {step}: {e}")
+                    response_text = ""
+
+                conversation.append({"role": "assistant", "content": response_text})
+                raw_action = parse_model_action(response_text)
+                if raw_action is None:
+                    diagnostics["parse_failures"] += 1
+
+                action, repaired = _validate_and_repair_action(
+                    raw_action,
+                    policy,
+                    step,
+                    observation,
+                    evidence,
+                )
+                if repaired:
+                    diagnostics["validation_repairs"] += 1
+
+            action_type = action.get("action_type", "?")
+
+            if action_type == "set_severity":
+                print(f"    [DEBUG] policy severity='{action.get('severity')}'")
+            elif action_type == "identify_root_cause":
+                print(
+                    f"    [DEBUG] policy category='{action.get('root_cause_category')}' cause='{str(action.get('root_cause', ''))[:60]}'"
+                )
+            elif action_type == "execute_remediation":
+                print(
+                    f"    [DEBUG] policy action='{action.get('remediation_action')}' target='{action.get('remediation_target')}'"
+                )
+
+            diagnostics["total_actions"] += 1
+            if not repaired:
+                diagnostics["valid_actions"] += 1
+            if action_type == "execute_remediation":
+                diagnostics["executed_remediation"] = True
+
+            print(f"    Step {step:2d}: {action_type:<25s}", end="")
 
             try:
-                completion = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=messages,
-                    temperature=TEMPERATURE,
-                    max_tokens=MAX_TOKENS,
-                )
-                response_text = completion.choices[0].message.content or ""
+                step_result = env.step(IncidentAction.model_validate(action))
+                observation, reward, done = _extract_step_payload(step_result)
             except Exception as e:
-                print(f"    LLM error at step {step}: {e}")
-                response_text = ""
+                print(f" ERROR: {e}")
+                done = True
+                reward = 0.0
+                observation = {}
 
-            conversation.append({"role": "assistant", "content": response_text})
-            raw_action = parse_model_action(response_text)
-            if raw_action is None:
-                diagnostics["parse_failures"] += 1
+            total_reward += reward
+            steps_taken = step
+            _advance_phase(policy, action_type, done)
 
-            action, repaired = _validate_and_repair_action(
-                raw_action,
-                policy,
-                step,
-                observation,
-                evidence,
-            )
-            if repaired:
-                diagnostics["validation_repairs"] += 1
+            print(f" reward={reward:+.3f}  done={done}")
+            history.append(f"Step {step}: {action_type} -> reward {reward:+.3f}")
 
-        action_type = action.get("action_type", "?")
+            if done:
+                diagnostics["terminal_reached"] = True
+                break
 
-        # Debug: print what the LLM is actually sending for diagnosis actions
-        if action_type == "set_severity":
-            print(f"    [DEBUG] LLM severity='{action.get('severity')}'")
-        elif action_type == "identify_root_cause":
-            print(
-                f"    [DEBUG] LLM category='{action.get('root_cause_category')}' cause='{str(action.get('root_cause', ''))[:60]}'"
-            )
-        elif action_type == "execute_remediation":
-            print(
-                f"    [DEBUG] LLM action='{action.get('remediation_action')}' target='{action.get('remediation_target')}'"
-            )
-
-        diagnostics["total_actions"] += 1
-        if not repaired:
-            diagnostics["valid_actions"] += 1
-        if action_type == "execute_remediation":
-            diagnostics["executed_remediation"] = True
-
-        print(f"    Step {step:2d}: {action_type:<25s}", end="")
-
-        # Execute action (OpenEnv HTTP API expects {"action": {...}})
         try:
-            resp = requests.post(
-                f"{env_url}/step",
-                json={"action": action},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            result = resp.json()
-        except Exception as e:
-            print(f" ERROR: {e}")
-            result = {"done": True, "observation": {}, "reward": 0}
-
-        observation = _normalize_observation(result.get("observation", result))
-        reward = result.get("reward") or observation.get("reward", 0)
-        total_reward += reward
-        steps_taken = step
-        done = result.get("done", False) or observation.get("done", False)
-        _advance_phase(policy, action_type, done)
-
-        print(f" reward={reward:+.3f}  done={done}")
-
-        history.append(f"Step {step}: {action_type} -> reward {reward:+.3f}")
-
-        if done:
-            diagnostics["terminal_reached"] = True
-            break
-
-    # Get final state for grading
-    try:
-        state_resp = requests.get(f"{env_url}/state", timeout=10)
-        state_resp.raise_for_status()
-        final_state = state_resp.json()
-    except Exception:
-        final_state = {}
+            final_state = _extract_state_payload(env)
+        except Exception:
+            final_state = {}
 
     duration = time.time() - start_time
 
