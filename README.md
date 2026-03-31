@@ -1,3 +1,19 @@
+---
+title: OnCall Incident Triage Environment
+emoji: 🔊
+colorFrom: blue
+colorTo: purple
+sdk: docker
+pinned: false
+app_port: 7860
+base_path: /web
+tags:
+  - openenv
+  - sre
+  - incident-response
+  - agentic-rl
+---
+
 # OnCall Incident Triage Environment
 
 > An [OpenEnv](https://github.com/huggingface/open-env) environment that simulates production incident response.
@@ -223,14 +239,14 @@ python -m pytest oncall_env/tests/test_integration.py -v   # Integration tests
 
 ## Baseline Scores
 
-*Scores from baseline inference agent (to be filled after running `python inference.py`):*
+*LLM baseline (`DETERMINISTIC_BASELINE=0`) using provider `gemini`, model `gemini-3-flash-preview`, seed `42`:*
 
 | Task | Score | Steps | Time |
 |------|-------|-------|------|
-| Easy | — | — | — |
-| Medium | — | — | — |
-| Hard | — | — | — |
-| **Average** | **—** | | |
+| Easy | 0.9071 | 7 | 32.2s |
+| Medium | 0.7550 | 7 | 36.2s |
+| Hard | 0.7500 | 7 | 34.5s |
+| **Average** | **0.8040** | | |
 
 ---
 
