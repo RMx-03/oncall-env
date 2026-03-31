@@ -125,43 +125,44 @@ client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 SYSTEM_PROMPT = """You are an expert SRE/DevOps engineer responding to a production incident.
-You have a LIMITED budget of actions. You MUST complete the full incident workflow before running out.
+You have a LIMITED budget of actions (7 steps). You MUST complete the full incident workflow.
 
 You interact with an incident response environment by outputting a SINGLE JSON action object.
+Output ONLY valid JSON. No markdown, no explanation, no text before or after the JSON.
 
 Available actions:
-1. INVESTIGATE (do 2-4 of these, no more):
+1. INVESTIGATE (steps 1-4, no more):
    {"action_type": "check_alerts"}
    {"action_type": "check_service_status"}
    {"action_type": "query_logs", "service_name": "<service>"}
    {"action_type": "query_metrics", "service_name": "<service>"}
 
-2. DIAGNOSE (do these after investigating):
+2. DIAGNOSE (steps 5-6):
    {"action_type": "set_severity", "severity": "<P1|P2|P3|P4>"}
-   {"action_type": "identify_root_cause", "root_cause": "<description>", "root_cause_category": "<database|network|config|resource|dependency|security>"}
+   {"action_type": "identify_root_cause", "root_cause": "<short description>", "root_cause_category": "<database|network|config|resource|dependency|security>"}
 
-3. REMEDIATE (do this LAST — it ends the episode):
+3. REMEDIATE (step 7 — ends the episode):
    {"action_type": "execute_remediation", "remediation_action": "<restart_service|scale_up|rollback_deploy|flush_cache|fix_config|failover_db>", "remediation_target": "<service>"}
 
 Available services: api-gw, order-svc, order-db, payment-svc, auth-svc, notification-svc, cache, search-svc
 
-You MUST follow this exact workflow:
-  Step 1: check_alerts
-  Step 2: check_service_status
-  Step 3: query_logs for the most suspicious service
-  Step 4: query_metrics for the most suspicious service
-  Step 5: set_severity
-  Step 6: identify_root_cause
-  Step 7: execute_remediation
+EXACT workflow:
+  Step 1: check_alerts — read which services have critical/warning alerts
+  Step 2: check_service_status — find which service is "down" or "degraded"
+  Step 3: query_logs for the service that is DOWN or has critical alerts
+  Step 4: query_metrics for that same service
+  Step 5: set_severity — P1 if multiple services down, P2 if one service down, P3 if degraded only, P4 if minor
+  Step 6: identify_root_cause — based on error logs:
+    - OutOfMemoryError/OOM/exit code 137 -> category "resource", action "restart_service"
+    - Connection pool/connection refused/too many connections -> category "database", action "failover_db"
+    - DNS/TLS/certificate/timeout -> category "network", action "fix_config"
+    - Deploy/rollback/version mismatch -> category "config", action "rollback_deploy"
+    - Cache eviction/miss rate spike -> category "resource", action "flush_cache"
+  Step 7: execute_remediation — use the action from step 6 targeting the DOWN service
 
-Do NOT repeat the same action. Do NOT keep investigating forever.
-After 4-5 investigation actions, you MUST move to set_severity, then identify_root_cause, then execute_remediation.
-
-CRITICAL RULES:
-- Output ONLY a single JSON object. No text before or after.
-- NEVER repeat an action you already took.
-- By step 5 you MUST start diagnosing (set_severity).
-- By step 7 you MUST execute remediation."""
+CRITICAL: When you see logs, focus on ERROR and FATAL lines. They tell you the root cause.
+CRITICAL: The remediation_target MUST be the service that is DOWN, not a healthy service.
+CRITICAL: Keep root_cause descriptions SHORT (under 20 words)."""
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -236,6 +237,12 @@ def build_user_prompt(
             for s in statuses
         )
         parts.append(f"\n**Service statuses**:\n{status_text}")
+        
+        # Explicitly call out broken services so LLM targets them
+        broken = [s for s in statuses if isinstance(s, dict) and s.get('status') in ('down', 'degraded')]
+        if broken:
+            broken_text = ", ".join(f"{s['service']} ({s['status']})" for s in broken)
+            parts.append(f"\n⚠️ BROKEN SERVICES: {broken_text} — query logs/metrics for these!")
 
     # Progress flags
     parts.append(
@@ -372,10 +379,21 @@ def parse_model_action(response_text: str) -> Dict[str, Any]:
             parsed = json.loads(json_str)
             if isinstance(parsed, dict) and "action_type" in parsed:
                 return parsed
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            print(f"    [PARSE DEBUG] Bracket-match found JSON but decode failed: {e}")
+            print(f"    [PARSE DEBUG] Extracted: {json_str[:300]}")
+    else:
+        # Also try on cleaned text
+        json_str2 = _extract_json_object(cleaned)
+        if json_str2:
+            try:
+                parsed = json.loads(json_str2)
+                if isinstance(parsed, dict) and "action_type" in parsed:
+                    return parsed
+            except json.JSONDecodeError:
+                pass
 
-    print(f"    WARNING: Could not parse action, using fallback. Raw: {response_text[:200]}")
+    print(f"    WARNING: Could not parse action, using fallback. Raw: {response_text[:300]}")
     return dict(FALLBACK_ACTION)
 
 
@@ -398,10 +416,10 @@ def run_episode(env_url: str, task_id: str) -> Dict[str, Any]:
 
     start_time = time.time()
 
-    # Reset environment
+    # Reset environment (fixed seed for reproducibility — hackathon requirement)
     resp = requests.post(
         f"{env_url}/reset",
-        json={"task_id": task_id},
+        json={"task_id": task_id, "seed": 42},
         timeout=30,
     )
     resp.raise_for_status()
@@ -448,6 +466,14 @@ def run_episode(env_url: str, task_id: str) -> Dict[str, Any]:
         # Parse action
         action = parse_model_action(response_text)
         action_type = action.get("action_type", "?")
+
+        # Debug: print what the LLM is actually sending for diagnosis actions
+        if action_type == "set_severity":
+            print(f"    [DEBUG] LLM severity='{action.get('severity')}'")
+        elif action_type == "identify_root_cause":
+            print(f"    [DEBUG] LLM category='{action.get('root_cause_category')}' cause='{str(action.get('root_cause',''))[:60]}'")
+        elif action_type == "execute_remediation":
+            print(f"    [DEBUG] LLM action='{action.get('remediation_action')}' target='{action.get('remediation_target')}'")
 
         # ── Force progression: prevent infinite loops ──
         severity_set = observation.get("severity_set", False)
