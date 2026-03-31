@@ -13,6 +13,7 @@ Usage:
 """
 
 from openenv.core.env_server.http_server import create_app
+from fastapi.responses import RedirectResponse
 
 from oncall_env.models import IncidentAction, IncidentObservation
 
@@ -26,6 +27,12 @@ app = create_app(
     IncidentObservation,
     env_name="oncall_env",
 )
+
+
+@app.get("/")
+def root() -> RedirectResponse:
+    """Provide a root route so platform probes receive a valid response."""
+    return RedirectResponse(url="/web", status_code=307)
 
 
 def main() -> None:
